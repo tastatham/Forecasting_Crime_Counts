@@ -1,0 +1,218 @@
+---
+title: "Forecasting Crime using Bayesian Spatio-temporal areal unit models"
+author: "Thomas Statham"
+date: "16/07/2020"
+output: html_document
+---
+
+```{r, message=FALSE}
+# Easy file paths
+library(here)
+# Fast reading csv
+library(vroom)
+# Wrangling pkgs
+library(tidyverse);
+# Spatial pkgs
+library(sf); library(spdep);
+# API pkgs
+library(httr); library(jsonlite); library(RCurl);
+# Analysis pkgs
+library(INLA); library(brinla); library(INLAOutputs);
+```
+
+
+The following API requests all rely on the tidyverse, httr, and jsonlite R packages. Make sure that you have installed them.
+
+
+## Load 
+
+Below we download the LSOA geography, which forms two purposes;
+1. We use this geography as the unit of analysis
+2. We use this geography to define a bounding box, which will constrain the API search to within Liverpool
+
+We use the ONS REST API call to download the LSOA geography. If this works correctly, we should get 298 LSOAs. Note: this API will probably change in the future and another method of retrieving the LSOA geography data will need to be used.
+
+We will subset the API into four features. This allows us to easily modify the API call for a different study area.
+
+After downloading the data, we reproject the data into the projected coordinate system British National Grid. This will give greater accuracy from the effect of distortions when we calculate distances later. We also simplify our geometry using the Douglas-Peucker algorithm. Again, we apply this algorithm to the reprojected lsoas because this is sensitive to distortions. Finally, we reformat the bounding box for the API call. 
+
+
+Next we download the crime data for 2017 using the Police.uk API. 
+
+```{r}
+# Define four features of API
+endpoint = 'https://ons-inspire.esriuk.com/arcgis/rest/services/'
+boundary_lyr = 'Census_Boundaries/Lower_Super_Output_Areas_December_2011_Boundaries/'
+resolution = 'MapServer/2/'
+query = 'query?where=UPPER(lsoa11nm)%20like%20%27%25LIVERPOOL%25%27&outFields=*&outSR=4326&f=json'
+# Download liverpool lsoas through API
+liv = st_read(str_c(endpoint,boundary_lyr,resolution,query,sep='/'))
+# Transform to British National Grid to simplify object & to use later
+liv_bng = st_transform(liv,crs=27700) %>%
+  st_simplify(dTolerance = 0.05) %>% # Simplify object
+  st_cast("MULTIPOLYGON") %>% # Cast as multipoly
+  select(lsoa11cd, lsoa11nm) # Subset lsoa11cd/geometry only
+# Transform back to 4326 - ins is because the
+liv = st_transform(liv_bng,crs=4326)
+# Drop geometry for merging later
+liv_null = liv %>%
+  st_drop_geometry()
+# Plot with red for liverpool fc
+plot(st_geometry(liv), col='red')
+```
+
+```{r}
+source(here('R/crime_download.R'))
+# Define date range
+date = seq(as.Date('2019/01/01'), by = 'month', length.out = 12)
+# Define dates without days
+dates = date %>%
+str_sub(end=-4) %>% # Drop days
+as.list() # Convert to list
+# Iterate through list of dates and apply function
+crime_2019 = lapply(dates, crime_api, poly=liv)
+# Row bind list of df to single df
+crime_2019 = do.call(rbind, crime_2019)
+crime_2019$month = as.Date(paste(crime_2019$month,"-01",sep=""))
+# Convert to sf object
+crime_2019 = st_as_sf(crime_2019, coords = c('lng', 'lat'),crs = 4326) %>% # Make spatial
+  st_transform(crs=27700) # Reproject
+# Add crime count data
+crime_2019$count = 1
+# Merge crime api data with boundary
+crime_2019 = st_join(liv_bng, crime_2019, join = st_intersects) %>% # point in poly
+  na.omit() %>% # Drop no lsoa matches
+  group_by(lsoa11cd, month) %>% # Group by
+  summarise(count = sum(count)) #%>%  # Summarise by count
+  arrange(month) # Order by ascending
+
+crime_2019$month = as.Date(crime_2019$month, format="%Y-%m")
+```
+
+
+```{r}
+# Create dataframe based on range of months and repeat by 
+df = data.frame(list(month=date)) %>%  
+  slice(rep(1:n(), each = length(liv$lsoa11cd)))
+
+# Repeat time stamps by n msoas
+df1 = df %>%  
+  slice(rep(1:n(), each = length(liv$lsoa11cd)))
+# Repeat msoas by n months
+df1$count1 = 0
+# Repeat msoas by n months
+df2 = do.call("rbind", replicate(length(df$month), liv_null, simplify = FALSE)) %>% 
+  bind_cols(df1) %>%  
+  group_by(lsoa11cd, month) %>%
+  summarise(count1 = sum(count))
+
+# Merge dummy dataset with actual dataset and replace null values with 0
+crime_2019 = crime_2019 %>%
+  full_join(df2, by=c('lsoa11cd', 'month')) %>%
+  replace_na(list(count=0)) %>%
+  select(-count1)
+```
+
+
+
+```{r, message=FALSE}
+iuc = vroom(here('/data/iuc2018.csv'), col_select = ends_with(c('LSOA11_CD','GRP_CD'))) %>%
+rename(lsoa11cd = LSOA11_CD, iuc_group = GRP_CD) %>% # Rename cols
+inner_join(liv_null, by='lsoa11cd') %>% # Inner join lookup table
+select(lsoa11cd, iuc_group) #%>% # Subset columns
+
+imd = vroom(here('/data/imd2015.csv'), col_select = c(1, 5, 8, 14)) %>%
+rename(lsoa11cd = 1, imd_score=2, income_score=3, education_score=4) %>% # Rename cols
+inner_join(liv_null, by='lsoa11cd') %>% # Inner join lookup table
+select(lsoa11cd, imd_score, income_score, education_score) #%>% # Subset columns
+```
+
+```{r, message=FALSE}
+# Define unique lsoa
+lsoa = unique(liv$lsoa11cd)
+# Subset first 2 items
+lsoa = str_sub(lsoa, start=3)
+
+# Ask for API key
+api_key = rstudioapi::askForPassword()
+# Define url
+url = 'https://stat-xplore.dwp.gov.uk/webapi/rest/v1/table'
+
+# Define query
+query = list(database = unbox('str:database:hb_new'),
+measures = 'str:count:hb_new:V_F_HB_NEW',
+dimensions = c('str:field:hb_new:V_F_HB_NEW:COA_CODE',
+'str:field:hb_new:F_HB_NEW_DATE:NEW_DATE_NAME') %>% matrix(),
+recodes = list(
+`str:field:hb_new:V_F_HB_NEW:COA_CODE` = list(
+map = as.list(paste0('str:value:hb_new:V_F_HB_NEW:COA_CODE:V_C_MASTERGEOG11_LSOA_TO_MSOA:E0', lsoa))),
+`str:field:hb_new:F_HB_NEW_DATE:NEW_DATE_NAME` = list(
+map = list('str:value:hb_new:F_HB_NEW_DATE:NEW_DATE_NAME:C_HB_NEW_DATE:201906'))
+)) %>% toJSON()
+
+# Define request
+request = POST(
+url=url,
+body=query,
+config=add_headers(APIKey=api_key),
+encode='json')
+
+# Define response
+response = fromJSON(content(request, as='text'), flatten=TRUE)
+# Extrast list items and convert to a dataframe
+dimnames = response$fields$items %>%
+  map(~.$labels %>% unlist)
+values = response$cubes[[1]]$values
+dimnames(values) = dimnames
+
+house_benefits = as.data.frame.table(values, stringsAsFactors=FALSE) %>%
+as_tibble() %>%
+set_names(c(response$fields$label,'value')) %>%
+rename(lsoa11nm=1, benefits=value) %>%
+select(-Month)
+```
+
+
+```{r}
+crime_2019_sub = crime_2019 %>%
+group_by(lsoa11cd, lsoa11nm) %>%
+summarise(count = sum(count))
+
+# Merge all variables with the broadband faults
+liv_crime= crime_2019_sub %>%
+  inner_join(house_benefits, by='lsoa11nm') %>%
+  inner_join(iuc, by='lsoa11cd') %>%
+  inner_join(imd, by='lsoa11cd') %>%
+  select(count, benefits, iuc_group, imd_score, education_score) %>% # Subset cols
+  st_drop_geometry() # drop geom
+```
+
+```{r}
+corr_var(liv_crime, # name of dataset
+  count, # name of variable to focus on
+  top = 5 # display top 5 correlations
+)
+```
+
+
+
+
+
+pwd = rstudioapi::askForPassword()
+
+
+
+
+```{r}
+coords = st_coordinates(st_centroid(st_geometry(liv_crime)))
+xx <- poly2nb(as(liv_crime, "Spatial"))
+plot(xx, coords)
+# Create binary  matrix by specifying style="B" & zero policy ensures matrix is complete even if there are no neighbours
+adj = nb2mat(xx, style="B", zero.policy=TRUE)
+# Define as spare matrix
+adj = as(adj, "dgTMatrix")
+nb2INLA("map.adj", nb)
+nb2INLA("map.adj", xx)
+g <- inla.read.graph(filename = "map.adj")
+xx <- poly2nb(as(liv_crime, "Spatial"),queen = TRUE)
+plot(xx, coords)
