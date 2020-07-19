@@ -61,7 +61,7 @@ liv_null = liv %>%
 plot(st_geometry(liv), col='red')
 ```
 
-```{r}
+```{r, message=FALSE}
 source(here('R/crime_download.R'))
 # Define date range
 date = seq(as.Date('2019/01/01'), by = 'month', length.out = 12)
@@ -82,7 +82,7 @@ crime_2019$count = 1
 # Merge crime api data with boundary
 crime_2019 = st_join(liv_bng, crime_2019, join = st_intersects) %>% # point in poly
   na.omit() %>% # Drop no lsoa matches
-  group_by(lsoa11cd, month) %>% # Group by
+  group_by(lsoa11cd, lsoa11nm, month) #%>% # Group by
   summarise(count = sum(count)) #%>%  # Summarise by count
   arrange(month) # Order by ascending
 
