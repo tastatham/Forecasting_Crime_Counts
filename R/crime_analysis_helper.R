@@ -31,9 +31,6 @@ stop('API call not Valid - check documentation')
 
 }
 
-# Define date range
-date = seq(as.Date('2019/01/01'), by = 'month', length.out = 12) 
-
-dates = date %>% 
-  str_sub(end=-4) %>% # Drop days
-  as.list() # Convert to list
+mode <- function(codes){
+which.max(tabulate(codes))
+}
