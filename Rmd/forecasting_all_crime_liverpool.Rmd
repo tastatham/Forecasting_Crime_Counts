@@ -216,3 +216,14 @@ nb2INLA("map.adj", xx)
 g <- inla.read.graph(filename = "map.adj")
 xx <- poly2nb(as(liv_crime, "Spatial"),queen = TRUE)
 plot(xx, coords)
+```
+
+
+## Conditional Auto Regressive (CAR) models
+When working with spatial data, it is reasonable to assume that observations in neighboring areas may be more or less alike simply due to their proximity, and hence exhibit autocorrelation47. We confirm this by first running a Moran’s I test, which measures whether spatial autocorrelation is present in the data. Due to this autocorrelation, we cannot run a simple linear regression analysis, as spatial dependencies would exist in the error term. Hence, we run our analysis using a conditional autoregressive prior (CAR), as initially proposed by Besag and colleagues51,52, which captures spatial dependence between neighbors through an adjacency matrix of the areal units.
+
+The CAR model quantifies the spatial relationship in the data by including a conditional distribution in the error term for area i, ei. The conditional distribution of ei is thus represented as:
+
+$$e_j \sim i \sim N \Bigg(\sum_{j\sim i} \frac{c_{ij}e_j}{\sum_{j \sim i} c_{ij}}, \frac{\sigma^2_{ei} }{\sum_{j \sim i} c_{ij}} \Bigg)$$
+
+where ej~i is the e–i vector including only neighboring areas of i; e–i is the vector of all the errors terms except for e–i itself; and cij are dependence parameters used to represent the spatial dependence between the area
