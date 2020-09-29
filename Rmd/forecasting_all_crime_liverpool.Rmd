@@ -241,7 +241,7 @@ where ej~i is the e–i vector including only neighboring areas of i; e–i is t
 ```{r}
 st_model = function(data, graph){
   st_model = count ~ 1 +
-  #f(lsoa11cd1, model='bym', graph=graph) + # modellng structured + unstructured spatial components
+  f(lsoa11cd1, model='bym', graph=graph) + # modellng structured + unstructured spatial components
   f(month,model='ar1') + # temporal structured component
   f(month1,model='iid')  # temporal unstructured component
   
@@ -254,4 +254,3 @@ st_model = function(data, graph){
 dec_pred = st_model(data=df, graph=g)
 summary(dec_pred)
 ```
-
