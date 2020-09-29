@@ -5,6 +5,8 @@ date: "16/07/2020"
 output: html_document
 ---
 
+Using crime data for 2019, we use the months Jan-Dec to forecast the crime in December at the LSOA level in Liverpool, England. 
+
 ```{r, message=FALSE}
 # Easy file paths
 library(here)
@@ -20,24 +22,7 @@ library(httr); library(jsonlite); library(RCurl);
 library(INLA); library(brinla); library(INLAOutputs);
 ```
 
-
-The following API requests all rely on the tidyverse, httr, and jsonlite R packages. Make sure that you have installed them.
-
-
-## Load 
-
-Below we download the LSOA geography, which forms two purposes;
-1. We use this geography as the unit of analysis
-2. We use this geography to define a bounding box, which will constrain the API search to within Liverpool
-
-We use the ONS REST API call to download the LSOA geography. If this works correctly, we should get 298 LSOAs. Note: this API will probably change in the future and another method of retrieving the LSOA geography data will need to be used.
-
-We will subset the API into four features. This allows us to easily modify the API call for a different study area.
-
-After downloading the data, we reproject the data into the projected coordinate system British National Grid. This will give greater accuracy from the effect of distortions when we calculate distances later. We also simplify our geometry using the Douglas-Peucker algorithm. Again, we apply this algorithm to the reprojected lsoas because this is sensitive to distortions. Finally, we reformat the bounding box for the API call. 
-
-
-Next we download the crime data for 2017 using the Police.uk API. 
+We first download the lsoa boundary data for Liverpool
 
 ```{r}
 # Define four features of API
@@ -61,6 +46,8 @@ liv_null = liv %>%
 plot(st_geometry(liv), col='red')
 ```
 
+Get crime (target) data from Police API.
+
 ```{r, message=FALSE}
 source(here('R/crime_analysis_helper.R'))
 # Define date range
@@ -72,6 +59,8 @@ as.list() # Convert to list
 # Iterate through list of dates and apply function
 crime_2019 = lapply(dates, crime_api, poly=liv)
 ```
+
+Aggregate crime point data to lsoa level.
 
 ```{r}
 # Row bind list of df to single df
@@ -88,8 +77,9 @@ crime_2019 = st_join(liv_bng, crime_2019, join = st_intersects) %>% # point in p
   summarise(count = sum(count)) %>%  # Summarise by count
   arrange(month) # Order by ascending
 ```
+## Add 0 values to months with no data
+We first generate dummy data to insert 0 values into lsoas which have no data for each time period. We then merge the dummy dataset back to the actual dataset and replace null values with 0.
 
-Generate dummy data to insert 0 values into lsoas which have no data for each time period. 
 ```{r}
 # Create dataframe based on range of months and repeat by 
 df = data.frame(list(month=date)) %>%  
@@ -112,7 +102,7 @@ crime_2019 = crime_2019 %>%
   mutate(count=replace_na(count,0)) %>%
   select(-'n()')
 ```
-
+## Load and process predictors from csv
 
 ```{r, message=FALSE}
 iuc = vroom(here('/data/iuc2018.csv'), col_select = ends_with(c('LSOA11_CD','GRP_CD'))) %>%
@@ -125,6 +115,9 @@ rename(lsoa11cd = 1, imd_score=2, income_score=3, education_score=4) %>% # Renam
 inner_join(liv_null, by='lsoa11cd') %>% # Inner join lookup table
 select(lsoa11cd, imd_score, income_score, education_score) #%>% # Subset columns
 ```
+
+## Using the [Stat-Explore-API](https://stat-xplore.dwp.gov.uk/webapi/online-help/Open-Data-API.html) we will download housing benefits data. 
+Note: You will need to obtain the API key.
 
 ```{r, message=FALSE}
 # Define unique lsoa
@@ -163,7 +156,7 @@ dimnames = response$fields$items %>%
   map(~.$labels %>% unlist)
 values = response$cubes[[1]]$values
 dimnames(values) = dimnames
-
+# Convert to DataFrame
 house_benefits = as.data.frame.table(values, stringsAsFactors=FALSE) %>%
 as_tibble() %>%
 set_names(c(response$fields$label,'value')) %>%
@@ -171,6 +164,7 @@ rename(lsoa11nm=1, benefits=value) %>%
 select(-Month)
 ```
 
+## Next we merge all of our predictors with the target variable.
 
 ```{r}
 # This is just to test the merge works
@@ -187,6 +181,8 @@ liv_crime= crime_2019_sub %>%
   st_drop_geometry() # drop geom
 ```
 
+## Check the correlation of predictors with target variables. 
+
 ```{r}
 library(lares)
 lares::corr_var(liv_crime, # name of dataset
@@ -195,8 +191,7 @@ lares::corr_var(liv_crime, # name of dataset
 )
 ```
 
-
-
+## Create adjacency matrix for specifying the spatial relationship between lsoas
 
 ```{r}
 coords = st_coordinates(st_centroid(st_geometry(liv_bng)))
@@ -206,14 +201,15 @@ plot(xx, coords)
 adj = nb2mat(xx, style="B", zero.policy=TRUE)
 # Define as spare matrix
 adj = as(adj, "dgTMatrix")
+# 
 nb2INLA("map.adj", xx)
 g = inla.read.graph(filename = "map.adj")
 ```
 
-
 ## Generate nas in data
+
 ```{r}
-# Generate data for forecasting december crime
+# Generate data for forecasting December crime
 df = crime_2019 %>%
   # Drop geoms
   st_drop_geometry() %>% 
@@ -227,14 +223,20 @@ df$month1 = df$month
 df$lsoa11cd1 =  as.numeric(as.factor(rep(df$lsoa11cd)))
 ```
 
-## Conditional Auto Regressive (CAR) models
+## Specify space-time forecasting model
+
+
+### Conditional Auto Regressive (CAR) models
 When working with spatial data, it is reasonable to assume that observations in neighboring areas may be more or less alike simply due to their proximity, and hence exhibit autocorrelation47. We confirm this by first running a Moran’s I test, which measures whether spatial autocorrelation is present in the data. Due to this autocorrelation, we cannot run a simple linear regression analysis, as spatial dependencies would exist in the error term. Hence, we run our analysis using a conditional autoregressive prior (CAR), as initially proposed by Besag and colleagues51,52, which captures spatial dependence between neighbors through an adjacency matrix of the areal units.
 
 The CAR model quantifies the spatial relationship in the data by including a conditional distribution in the error term for area i, ei. The conditional distribution of ei is thus represented as:
 
 $$e_j \sim i \sim N \Bigg(\sum_{j\sim i} \frac{c_{ij}e_j}{\sum_{j \sim i} c_{ij}}, \frac{\sigma^2_{ei} }{\sum_{j \sim i} c_{ij}} \Bigg)$$
 
-where ej~i is the e–i vector including only neighboring areas of i; e–i is the vector of all the errors terms except for e–i itself; and cij are dependence parameters used to represent the spatial dependence between the area
+where ej~i is the e–i vector including only neighboring areas of i; e–i is the vector of all the errors terms except for e–i itself; and cij are dependence parameters used to represent the spatial dependence between the area.
+
+## AutoRegressive 1 model
+...
 
 ```{r}
 st_model = function(data, graph){
