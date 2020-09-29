@@ -11,7 +11,7 @@ library(here)
 # Fast reading csv
 library(vroom)
 # Wrangling pkgs
-library(tidyverse);
+library(tidyverse)
 # Spatial pkgs
 library(sf); library(spdep);
 # API pkgs
@@ -57,23 +57,25 @@ liv = st_transform(liv_bng,crs=4326)
 # Drop geometry for merging later
 liv_null = liv %>%
   st_drop_geometry()
-# Plot with red for liverpool fc
+# Plot with red because Liverpool FC
 plot(st_geometry(liv), col='red')
 ```
 
 ```{r, message=FALSE}
-source(here('R/crime_download.R'))
+source(here('R/crime_analysis_helper.R'))
 # Define date range
-date = seq(as.Date('2019/01/01'), by = 'month', length.out = 12)
+date = seq(as.Date('2019/01/01'), by = 'month', length.out = 12) %>% 
+  str_sub(end=-4)
 # Define dates without days
 dates = date %>%
-str_sub(end=-4) %>% # Drop days
 as.list() # Convert to list
 # Iterate through list of dates and apply function
 crime_2019 = lapply(dates, crime_api, poly=liv)
+```
+
+```{r}
 # Row bind list of df to single df
 crime_2019 = do.call(rbind, crime_2019)
-crime_2019$month = as.Date(paste(crime_2019$month,"-01",sep=""))
 # Convert to sf object
 crime_2019 = st_as_sf(crime_2019, coords = c('lng', 'lat'),crs = 4326) %>% # Make spatial
   st_transform(crs=27700) # Reproject
@@ -82,14 +84,12 @@ crime_2019$count = 1
 # Merge crime api data with boundary
 crime_2019 = st_join(liv_bng, crime_2019, join = st_intersects) %>% # point in poly
   na.omit() %>% # Drop no lsoa matches
-  group_by(lsoa11cd, lsoa11nm, month) #%>% # Group by
-  summarise(count = sum(count)) #%>%  # Summarise by count
+  group_by(lsoa11cd, lsoa11nm, month) %>% # Group by
+  summarise(count = sum(count)) %>%  # Summarise by count
   arrange(month) # Order by ascending
-
-crime_2019$month = as.Date(crime_2019$month, format="%Y-%m")
 ```
 
-
+Generate dummy data to insert 0 values into lsoas which have no data for each time period. 
 ```{r}
 # Create dataframe based on range of months and repeat by 
 df = data.frame(list(month=date)) %>%  
@@ -99,20 +99,19 @@ df = data.frame(list(month=date)) %>%
 df1 = df %>%  
   slice(rep(1:n(), each = length(liv$lsoa11cd)))
 # Repeat msoas by n months
-df1$count1 = 0
+df1$count1 = 1
 # Repeat msoas by n months
 df2 = do.call("rbind", replicate(length(df$month), liv_null, simplify = FALSE)) %>% 
   bind_cols(df1) %>%  
   group_by(lsoa11cd, month) %>%
-  summarise(count1 = sum(count))
-
+  summarize(n())
+  
 # Merge dummy dataset with actual dataset and replace null values with 0
 crime_2019 = crime_2019 %>%
   full_join(df2, by=c('lsoa11cd', 'month')) %>%
-  replace_na(list(count=0)) %>%
-  select(-count1)
+  mutate(count=replace_na(count,0)) %>%
+  select(-'n()')
 ```
-
 
 
 ```{r, message=FALSE}
@@ -174,6 +173,7 @@ select(-Month)
 
 
 ```{r}
+# This is just to test the merge works
 crime_2019_sub = crime_2019 %>%
 group_by(lsoa11cd, lsoa11nm) %>%
 summarise(count = sum(count))
@@ -188,7 +188,8 @@ liv_crime= crime_2019_sub %>%
 ```
 
 ```{r}
-corr_var(liv_crime, # name of dataset
+library(lares)
+lares::corr_var(liv_crime, # name of dataset
   count, # name of variable to focus on
   top = 5 # display top 5 correlations
 )
@@ -197,27 +198,34 @@ corr_var(liv_crime, # name of dataset
 
 
 
-
-pwd = rstudioapi::askForPassword()
-
-
-
-
 ```{r}
-coords = st_coordinates(st_centroid(st_geometry(liv_crime)))
-xx <- poly2nb(as(liv_crime, "Spatial"))
+coords = st_coordinates(st_centroid(st_geometry(liv_bng)))
+xx = poly2nb(as(liv_bng, 'Spatial'))
 plot(xx, coords)
 # Create binary  matrix by specifying style="B" & zero policy ensures matrix is complete even if there are no neighbours
 adj = nb2mat(xx, style="B", zero.policy=TRUE)
 # Define as spare matrix
 adj = as(adj, "dgTMatrix")
-nb2INLA("map.adj", nb)
 nb2INLA("map.adj", xx)
-g <- inla.read.graph(filename = "map.adj")
-xx <- poly2nb(as(liv_crime, "Spatial"),queen = TRUE)
-plot(xx, coords)
+g = inla.read.graph(filename = "map.adj")
 ```
 
+
+## Generate nas in data
+```{r}
+# Generate data for forecasting december crime
+df = crime_2019 %>%
+  # Drop geoms
+  st_drop_geometry() %>% 
+  # Select data
+  select(lsoa11cd, month, count) %>% 
+  # Input na
+  mutate(month=ifelse(month=='2020-12',NA, month))
+# Create copy of month for iid term
+df$month1 = df$month
+# Convert geography to numeric because inla requires numeric values 
+df$lsoa11cd1 =  as.numeric(as.factor(rep(df$lsoa11cd)))
+```
 
 ## Conditional Auto Regressive (CAR) models
 When working with spatial data, it is reasonable to assume that observations in neighboring areas may be more or less alike simply due to their proximity, and hence exhibit autocorrelation47. We confirm this by first running a Moran’s I test, which measures whether spatial autocorrelation is present in the data. Due to this autocorrelation, we cannot run a simple linear regression analysis, as spatial dependencies would exist in the error term. Hence, we run our analysis using a conditional autoregressive prior (CAR), as initially proposed by Besag and colleagues51,52, which captures spatial dependence between neighbors through an adjacency matrix of the areal units.
@@ -227,3 +235,21 @@ The CAR model quantifies the spatial relationship in the data by including a con
 $$e_j \sim i \sim N \Bigg(\sum_{j\sim i} \frac{c_{ij}e_j}{\sum_{j \sim i} c_{ij}}, \frac{\sigma^2_{ei} }{\sum_{j \sim i} c_{ij}} \Bigg)$$
 
 where ej~i is the e–i vector including only neighboring areas of i; e–i is the vector of all the errors terms except for e–i itself; and cij are dependence parameters used to represent the spatial dependence between the area
+
+```{r}
+st_model = function(data, graph){
+  st_model = count ~ 1 +
+  #f(lsoa11cd1, model='bym', graph=graph) + # modellng structured + unstructured spatial components
+  f(month,model='ar1') + # temporal structured component
+  f(month1,model='iid')  # temporal unstructured component
+  
+  inla_output = inla(st_model,family='poisson',data=data, 
+                        control.compute=list(dic=TRUE,config=TRUE),
+                        control.predictor=list(link=1))
+  return(inla_output)
+}
+
+dec_pred = st_model(data=df, graph=g)
+summary(dec_pred)
+```
+
